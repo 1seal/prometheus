@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"math/rand"
 	"os"
@@ -475,190 +476,224 @@ func BenchmarkLoadRealWLs(b *testing.B) {
 // While appending the samples to the head it concurrently queries them from multiple go routines and verifies that the
 // returned results are correct.
 func TestHead_HighConcurrencyReadAndWrite(t *testing.T) {
-	head, _ := newTestHead(t, DefaultBlockDuration, compression.None, false)
+	for range 1000 {
+		for _, appV2 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("appV2=%v", appV2), func(t *testing.T) {
+				head, _ := newTestHead(t, DefaultBlockDuration, compression.None, false)
 
-	seriesCnt := 1000
-	readConcurrency := 2
-	writeConcurrency := 10
-	startTs := uint64(DefaultBlockDuration) // start at the second block relative to the unix epoch.
-	qryRange := uint64(5 * time.Minute.Milliseconds())
-	step := uint64(15 * time.Second / time.Millisecond)
-	endTs := startTs + uint64(DefaultBlockDuration)
+				// TODO(bwplotka): Remove once we figure out flakiness (https://github.com/prometheus/prometheus/issues/17941)
+				head.logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	labelSets := make([]labels.Labels, seriesCnt)
-	for i := range seriesCnt {
-		labelSets[i] = labels.FromStrings("seriesId", strconv.Itoa(i))
-	}
+				seriesCnt := 1000
+				readConcurrency := 2
+				writeConcurrency := 10
+				startTs := uint64(DefaultBlockDuration) // Start at the second block relative to the unix epoch.
+				qryRange := uint64(5 * time.Minute.Milliseconds())
+				step := uint64(15 * time.Second / time.Millisecond)
+				endTs := startTs + uint64(DefaultBlockDuration)
 
-	head.Init(0)
+				labelSets := make([]labels.Labels, seriesCnt)
+				for i := range seriesCnt {
+					labelSets[i] = labels.FromStrings("seriesId", strconv.Itoa(i))
+				}
+				require.NoError(t, head.Init(0))
 
-	g, ctx := errgroup.WithContext(context.Background())
-	whileNotCanceled := func(f func() (bool, error)) error {
-		for ctx.Err() == nil {
-			cont, err := f()
-			if err != nil {
-				return err
-			}
-			if !cont {
-				return nil
-			}
-		}
-		return nil
-	}
-
-	// Create one channel for each write worker, the channels will be used by the coordinator
-	// go routine to coordinate which timestamps each write worker has to write.
-	writerTsCh := make([]chan uint64, writeConcurrency)
-	for writerTsChIdx := range writerTsCh {
-		writerTsCh[writerTsChIdx] = make(chan uint64)
-	}
-
-	// workerReadyWg is used to synchronize the start of the test,
-	// we only start the test once all workers signal that they're ready.
-	var workerReadyWg sync.WaitGroup
-	workerReadyWg.Add(writeConcurrency + readConcurrency)
-
-	// Start the write workers.
-	for wid := range writeConcurrency {
-		// Create copy of workerID to be used by worker routine.
-		workerID := wid
-
-		g.Go(func() error {
-			// The label sets which this worker will write.
-			workerLabelSets := labelSets[(seriesCnt/writeConcurrency)*workerID : (seriesCnt/writeConcurrency)*(workerID+1)]
-
-			// Signal that this worker is ready.
-			workerReadyWg.Done()
-
-			return whileNotCanceled(func() (bool, error) {
-				ts, ok := <-writerTsCh[workerID]
-				if !ok {
-					return false, nil
+				g, ctx := errgroup.WithContext(t.Context())
+				whileNotCanceled := func(f func() (bool, error)) error {
+					for ctx.Err() == nil {
+						cont, err := f()
+						if err != nil {
+							return err
+						}
+						if !cont {
+							return nil
+						}
+					}
+					return nil
 				}
 
-				app := head.Appender(ctx)
-				for i := range workerLabelSets {
-					// We also use the timestamp as the sample value.
-					_, err := app.Append(0, workerLabelSets[i], int64(ts), float64(ts))
+				// Create one channel for each write worker, the channels will be used by the coordinator
+				// go routine to coordinate which timestamps each write worker has to write.
+				writerTsCh := make([]chan uint64, writeConcurrency)
+				for writerTsChIdx := range writerTsCh {
+					writerTsCh[writerTsChIdx] = make(chan uint64)
+				}
+
+				// workerReadyWg is used to synchronize the start of the test,
+				// we only start the test once all workers signal that they're ready.
+				var workerReadyWg sync.WaitGroup
+				workerReadyWg.Add(writeConcurrency + readConcurrency)
+
+				// Start the write workers.
+				for wid := range writeConcurrency {
+					// Create copy of workerID to be used by worker routine.
+					workerID := wid
+
+					g.Go(func() error {
+						i := -1
+						// The label sets which this worker will write.
+						workerLabelSets := labelSets[(seriesCnt/writeConcurrency)*workerID : (seriesCnt/writeConcurrency)*(workerID+1)]
+
+						// Signal that this worker is ready.
+						workerReadyWg.Done()
+
+						return whileNotCanceled(func() (bool, error) {
+							i++
+							ts, ok := <-writerTsCh[workerID]
+							if !ok {
+								return false, nil
+							}
+
+							//if workerID == 2 {
+							//	head.logger.Warn("I am slower!", "workerID", workerID)
+							//	time.Sleep(1 * time.Second)
+							//}
+
+							aMinTime := head.appendableMinValidTime()
+							minTime := head.minTime.Load()
+							maxTime := head.MaxTime()
+							chL := head.chunkRange.Load() / 2
+							if head.minValidTime.Load() != 0 || ts <= uint64(aMinTime) {
+								head.logger.Warn("append", "ts", ts, "head.minValidTime", head.minValidTime.Load(), "minTime", minTime, "head.appendableMinValidTime", aMinTime, "workerID", workerID, "i", i, "max", maxTime, "chr", chL)
+							}
+
+							if appV2 {
+								app := head.AppenderV2(ctx)
+								for i := range workerLabelSets {
+									// We also use the timestamp as the sample value.
+									if _, err := app.Append(0, workerLabelSets[i], 0, int64(ts), float64(ts), nil, nil, storage.AOptions{}); err != nil {
+										return false, fmt.Errorf("error when appending (V2) to head: %w", err)
+									}
+								}
+								return true, app.Commit()
+							}
+
+							app := head.Appender(ctx)
+							for i := range workerLabelSets {
+								// We also use the timestamp as the sample value.
+								_, err := app.Append(0, workerLabelSets[i], int64(ts), float64(ts))
+								if err != nil {
+									return false, fmt.Errorf("error when appending to head: %w", err)
+								}
+							}
+							return true, app.Commit()
+						})
+					})
+				}
+
+				// queryHead is a helper to query the head for a given time range and labelset.
+				queryHead := func(mint, maxt uint64, label labels.Label) (map[string][]chunks.Sample, error) {
+					q, err := NewBlockQuerier(head, int64(mint), int64(maxt))
 					if err != nil {
-						return false, fmt.Errorf("Error when appending to head: %w", err)
+						return nil, err
 					}
+					return query(t, q, labels.MustNewMatcher(labels.MatchEqual, label.Name, label.Value)), nil
 				}
 
-				return true, app.Commit()
-			})
-		})
-	}
+				// readerTsCh will be used by the coordinator go routine to coordinate which timestamps the reader should read.
+				readerTsCh := make(chan uint64)
 
-	// queryHead is a helper to query the head for a given time range and labelset.
-	queryHead := func(mint, maxt uint64, label labels.Label) (map[string][]chunks.Sample, error) {
-		q, err := NewBlockQuerier(head, int64(mint), int64(maxt))
-		if err != nil {
-			return nil, err
-		}
-		return query(t, q, labels.MustNewMatcher(labels.MatchEqual, label.Name, label.Value)), nil
-	}
+				// Start the read workers.
+				for wid := range readConcurrency {
+					// Create copy of threadID to be used by worker routine.
+					workerID := wid
 
-	// readerTsCh will be used by the coordinator go routine to coordinate which timestamps the reader should read.
-	readerTsCh := make(chan uint64)
+					g.Go(func() error {
+						querySeriesRef := (seriesCnt / readConcurrency) * workerID
 
-	// Start the read workers.
-	for wid := range readConcurrency {
-		// Create copy of threadID to be used by worker routine.
-		workerID := wid
+						// Signal that this worker is ready.
+						workerReadyWg.Done()
 
-		g.Go(func() error {
-			querySeriesRef := (seriesCnt / readConcurrency) * workerID
+						return whileNotCanceled(func() (bool, error) {
+							ts, ok := <-readerTsCh
+							if !ok {
+								return false, nil
+							}
 
-			// Signal that this worker is ready.
-			workerReadyWg.Done()
+							querySeriesRef = (querySeriesRef + 1) % seriesCnt
+							lbls := labelSets[querySeriesRef]
+							// lbls has a single entry; extract it so we can run a query.
+							var lbl labels.Label
+							lbls.Range(func(l labels.Label) {
+								lbl = l
+							})
+							samples, err := queryHead(ts-qryRange, ts, lbl)
+							if err != nil {
+								return false, err
+							}
 
-			return whileNotCanceled(func() (bool, error) {
-				ts, ok := <-readerTsCh
-				if !ok {
-					return false, nil
+							if len(samples) != 1 {
+								return false, fmt.Errorf("expected 1 series, got %d", len(samples))
+							}
+
+							series := lbls.String()
+							expectSampleCnt := qryRange/step + 1
+							if expectSampleCnt != uint64(len(samples[series])) {
+								return false, fmt.Errorf("expected %d samples, got %d", expectSampleCnt, len(samples[series]))
+							}
+
+							for sampleIdx, sample := range samples[series] {
+								expectedValue := ts - qryRange + (uint64(sampleIdx) * step)
+								if sample.T() != int64(expectedValue) {
+									return false, fmt.Errorf("expected sample %d to have ts %d, got %d", sampleIdx, expectedValue, sample.T())
+								}
+								if sample.F() != float64(expectedValue) {
+									return false, fmt.Errorf("expected sample %d to have value %d, got %f", sampleIdx, expectedValue, sample.F())
+								}
+							}
+
+							return true, nil
+						})
+					})
 				}
 
-				querySeriesRef = (querySeriesRef + 1) % seriesCnt
-				lbls := labelSets[querySeriesRef]
-				// lbls has a single entry; extract it so we can run a query.
-				var lbl labels.Label
-				lbls.Range(func(l labels.Label) {
-					lbl = l
+				// Start the coordinator go routine.
+				g.Go(func() error {
+					currTs := startTs
+
+					defer func() {
+						// End of the test, close all channels to stop the workers.
+						for _, ch := range writerTsCh {
+							close(ch)
+						}
+						close(readerTsCh)
+					}()
+
+					// Wait until all workers are ready to start the test.
+					workerReadyWg.Wait()
+
+					return whileNotCanceled(func() (bool, error) {
+						// Send the current timestamp to each of the writers.
+						for _, ch := range writerTsCh {
+							select {
+							case ch <- currTs:
+							case <-ctx.Done():
+								return false, nil
+							}
+						}
+
+						// Once data for at least <qryRange> has been ingested, send the current timestamp to the readers.
+						if currTs > startTs+qryRange {
+							select {
+							case readerTsCh <- currTs - step:
+							case <-ctx.Done():
+								return false, nil
+							}
+						}
+
+						currTs += step
+						if currTs > endTs {
+							return false, nil
+						}
+
+						return true, nil
+					})
 				})
-				samples, err := queryHead(ts-qryRange, ts, lbl)
-				if err != nil {
-					return false, err
-				}
 
-				if len(samples) != 1 {
-					return false, fmt.Errorf("expected 1 series, got %d", len(samples))
-				}
-
-				series := lbls.String()
-				expectSampleCnt := qryRange/step + 1
-				if expectSampleCnt != uint64(len(samples[series])) {
-					return false, fmt.Errorf("expected %d samples, got %d", expectSampleCnt, len(samples[series]))
-				}
-
-				for sampleIdx, sample := range samples[series] {
-					expectedValue := ts - qryRange + (uint64(sampleIdx) * step)
-					if sample.T() != int64(expectedValue) {
-						return false, fmt.Errorf("expected sample %d to have ts %d, got %d", sampleIdx, expectedValue, sample.T())
-					}
-					if sample.F() != float64(expectedValue) {
-						return false, fmt.Errorf("expected sample %d to have value %d, got %f", sampleIdx, expectedValue, sample.F())
-					}
-				}
-
-				return true, nil
+				require.NoError(t, g.Wait())
 			})
-		})
+		}
 	}
-
-	// Start the coordinator go routine.
-	g.Go(func() error {
-		currTs := startTs
-
-		defer func() {
-			// End of the test, close all channels to stop the workers.
-			for _, ch := range writerTsCh {
-				close(ch)
-			}
-			close(readerTsCh)
-		}()
-
-		// Wait until all workers are ready to start the test.
-		workerReadyWg.Wait()
-		return whileNotCanceled(func() (bool, error) {
-			// Send the current timestamp to each of the writers.
-			for _, ch := range writerTsCh {
-				select {
-				case ch <- currTs:
-				case <-ctx.Done():
-					return false, nil
-				}
-			}
-
-			// Once data for at least <qryRange> has been ingested, send the current timestamp to the readers.
-			if currTs > startTs+qryRange {
-				select {
-				case readerTsCh <- currTs - step:
-				case <-ctx.Done():
-					return false, nil
-				}
-			}
-
-			currTs += step
-			if currTs > endTs {
-				return false, nil
-			}
-
-			return true, nil
-		})
-	})
-
-	require.NoError(t, g.Wait())
 }
 
 func TestHead_ReadWAL(t *testing.T) {
